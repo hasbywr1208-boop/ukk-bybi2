@@ -3,6 +3,7 @@ import db from "../config/db.js";
 import { generateBookingCode } from "../utils/bookingCode.js";
 import { generateQRCode } from "../utils/qrGenerator.js";
 import { getValidPromo, calculateDiscount } from "../utils/promo.js";
+import { generateEntryCode } from "../utils/entryCode.js";
 
 // CHECKOUT - CUSTOMER (promo_code opsional)
 export const checkout = async (req, res) => {
@@ -121,24 +122,36 @@ export const getMyTransactions = async (req, res) => {
 };
 
 // DETAIL TRANSAKSI - CUSTOMER (E-TIKET)
+// DETAIL TRANSAKSI - CUSTOMER (E-TIKET: QR + kode masuk)
 export const getTransactionDetail = async (req, res) => {
   try {
     const { id } = req.params;
-    const [rows] = await db.query(
-      `SELECT tr.*, e.title AS event_title, e.date AS event_date, e.start_time, e.venue, e.location, e.city, e.poster_url,
-              t.name AS ticket_name, u.name AS customer_name, u.email AS customer_email
-       FROM transactions tr
-       JOIN events e ON tr.event_id = e.id
-       JOIN tickets t ON tr.ticket_id = t.id
-       JOIN users u ON tr.user_id = u.id
-       WHERE tr.id = ?`,
-      [id]
-    );
+
+    const query = () =>
+      db.query(
+        `SELECT tr.*, e.title AS event_title, e.date AS event_date, e.start_time, e.venue, e.location, e.city, e.poster_url,
+                t.name AS ticket_name, u.name AS customer_name, u.email AS customer_email
+         FROM transactions tr
+         JOIN events e ON tr.event_id = e.id
+         JOIN tickets t ON tr.ticket_id = t.id
+         JOIN users u ON tr.user_id = u.id
+         WHERE tr.id = ?`,
+        [id]
+      );
+
+    let [rows] = await query();
     if (rows.length === 0) return res.status(404).json({ success: false, message: "Transaksi tidak ditemukan" });
 
-    const trx = rows[0];
+    let trx = rows[0];
     if (trx.user_id !== req.user.id && req.user.role !== "super_admin") {
       return res.status(403).json({ success: false, message: "Anda tidak berhak mengakses transaksi ini" });
+    }
+
+    // lengkapi e-tiket untuk transaksi paid yang belum punya QR / kode masuk
+    if (trx.status === "paid" && (!trx.ticket_qr_code || !trx.entry_code)) {
+      await generateETicket(id);
+      [rows] = await query();
+      trx = rows[0];
     }
 
     res.json({ success: true, data: trx });
@@ -146,45 +159,51 @@ export const getTransactionDetail = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
-// GENERATE E-TICKET (dipanggil otomatis setelah pembayaran sukses)
+// GENERATE E-TICKET: QR + kode masuk (dipanggil otomatis setelah pembayaran sukses)
 export const generateETicket = async (transactionId) => {
   const [rows] = await db.query(
-    `SELECT tr.*, e.title AS event_title, e.date AS event_date, u.name AS customer_name
-     FROM transactions tr
-     JOIN events e ON tr.event_id = e.id
-     JOIN users u ON tr.user_id = u.id
-     WHERE tr.id = ?`,
+    "SELECT id, booking_code, entry_code FROM transactions WHERE id = ?",
     [transactionId]
   );
   if (rows.length === 0) return;
 
   const trx = rows[0];
-  const qrData = {
-    booking_code: trx.booking_code,
-    event: trx.event_title,
-    date: trx.event_date,
-    customer: trx.customer_name,
-  };
-  const qrCode = await generateQRCode(qrData);
 
+  // kode masuk dibuat sekali saja; ulangi kalau kebetulan bentrok (UNIQUE)
+  if (!trx.entry_code) {
+    for (let i = 0; i < 5; i++) {
+      try {
+        await db.query(
+          "UPDATE transactions SET entry_code = ? WHERE id = ? AND entry_code IS NULL",
+          [generateEntryCode(), transactionId]
+        );
+        break;
+      } catch (err) {
+        if (err.code !== "ER_DUP_ENTRY") throw err;
+      }
+    }
+  }
+
+  const qrCode = await generateQRCode({ booking_code: trx.booking_code });
   await db.query("UPDATE transactions SET ticket_qr_code = ? WHERE id = ?", [qrCode, transactionId]);
 };
 
-// SCAN / CHECK-IN TIKET - ORGANIZER
+// SCAN / CHECK-IN - ORGANIZER (bisa dari QR atau ketik kode masuk)
 export const scanTicket = async (req, res) => {
   try {
-    let { booking_code } = req.body;
-    if (!booking_code) {
+    let { booking_code: input } = req.body; // field tetap "booking_code" supaya FE tidak berubah
+    if (!input) {
       return res.status(400).json({ success: false, message: "Kode tiket wajib diisi" });
     }
 
-    // isi QR berupa JSON, tapi kode mentah (diketik manual) juga diterima
+    // isi QR berupa JSON, tapi kode biasa juga diterima
     try {
-      const parsed = JSON.parse(booking_code);
-      if (parsed && parsed.booking_code) booking_code = parsed.booking_code;
+      const parsed = JSON.parse(input);
+      if (parsed && parsed.booking_code) input = parsed.booking_code;
     } catch {}
-    booking_code = String(booking_code).trim().toUpperCase();
+
+    const raw = String(input).trim().toUpperCase();
+    const entryCandidate = raw.replace(/[^A-Z0-9]/g, ""); // "K7M2-9QXA" -> "K7M29QXA"
 
     const [rows] = await db.query(
       `SELECT tr.id, tr.status, tr.quantity, tr.checked_in_at, e.organizer_id,
@@ -193,8 +212,8 @@ export const scanTicket = async (req, res) => {
        JOIN events e ON tr.event_id = e.id
        JOIN tickets t ON tr.ticket_id = t.id
        JOIN users u ON tr.user_id = u.id
-       WHERE tr.booking_code = ?`,
-      [booking_code]
+       WHERE tr.booking_code = ? OR tr.entry_code = ?`,
+      [raw, entryCandidate]
     );
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: "Tiket tidak ditemukan" });
@@ -208,7 +227,7 @@ export const scanTicket = async (req, res) => {
       return res.status(400).json({ success: false, message: "Tiket belum dibayar atau tidak valid" });
     }
 
-    // update bersyarat: aman walau dua petugas scan QR yang sama bersamaan
+    // update bersyarat: aman walau dua petugas memasukkan tiket yang sama bersamaan
     const [result] = await db.query(
       "UPDATE transactions SET checked_in_at = NOW() WHERE id = ? AND checked_in_at IS NULL",
       [trx.id]
@@ -234,7 +253,6 @@ export const scanTicket = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
 // LAPORAN PENJUALAN - ORGANIZER
 export const getSalesReport = async (req, res) => {
   try {
