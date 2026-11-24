@@ -171,6 +171,70 @@ export const generateETicket = async (transactionId) => {
   await db.query("UPDATE transactions SET ticket_qr_code = ? WHERE id = ?", [qrCode, transactionId]);
 };
 
+// SCAN / CHECK-IN TIKET - ORGANIZER
+export const scanTicket = async (req, res) => {
+  try {
+    let { booking_code } = req.body;
+    if (!booking_code) {
+      return res.status(400).json({ success: false, message: "Kode tiket wajib diisi" });
+    }
+
+    // isi QR berupa JSON, tapi kode mentah (diketik manual) juga diterima
+    try {
+      const parsed = JSON.parse(booking_code);
+      if (parsed && parsed.booking_code) booking_code = parsed.booking_code;
+    } catch {}
+    booking_code = String(booking_code).trim().toUpperCase();
+
+    const [rows] = await db.query(
+      `SELECT tr.id, tr.status, tr.quantity, tr.checked_in_at, e.organizer_id,
+              e.title AS event_title, t.name AS ticket_name, u.name AS customer_name
+       FROM transactions tr
+       JOIN events e ON tr.event_id = e.id
+       JOIN tickets t ON tr.ticket_id = t.id
+       JOIN users u ON tr.user_id = u.id
+       WHERE tr.booking_code = ?`,
+      [booking_code]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Tiket tidak ditemukan" });
+    }
+
+    const trx = rows[0];
+    if (trx.organizer_id !== req.user.id && req.user.role !== "super_admin") {
+      return res.status(403).json({ success: false, message: "Tiket ini bukan untuk event Anda" });
+    }
+    if (trx.status !== "paid") {
+      return res.status(400).json({ success: false, message: "Tiket belum dibayar atau tidak valid" });
+    }
+
+    // update bersyarat: aman walau dua petugas scan QR yang sama bersamaan
+    const [result] = await db.query(
+      "UPDATE transactions SET checked_in_at = NOW() WHERE id = ? AND checked_in_at IS NULL",
+      [trx.id]
+    );
+    if (result.affectedRows === 0) {
+      return res.status(409).json({
+        success: false,
+        message: `Tiket sudah dipakai pada ${trx.checked_in_at}`,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Check-in berhasil",
+      data: {
+        event: trx.event_title,
+        ticket: trx.ticket_name,
+        customer: trx.customer_name,
+        quantity: trx.quantity,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // LAPORAN PENJUALAN - ORGANIZER
 export const getSalesReport = async (req, res) => {
   try {
