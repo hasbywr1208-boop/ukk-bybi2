@@ -11,6 +11,7 @@ import transactionRoutes from "./routes/transactionRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import organizerRoutes from "./routes/organizerRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import promoRoutes from "./routes/promoRoutes.js";
 
 dotenv.config();
 
@@ -20,6 +21,7 @@ app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
+
 
 app.get("/", (req, res) => {
   res.json({ success: true, message: "Concert Ticket Booking API is running 🎫" });
@@ -33,6 +35,7 @@ app.use("/api/transactions", transactionRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/organizer", organizerRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/promos", promoRoutes);
 
 // 404 handler
 app.use((req, res) => {

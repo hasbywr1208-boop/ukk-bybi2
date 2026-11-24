@@ -2,12 +2,13 @@ import { v4 as uuidv4 } from "uuid";
 import db from "../config/db.js";
 import { generateBookingCode } from "../utils/bookingCode.js";
 import { generateQRCode } from "../utils/qrGenerator.js";
+import { getValidPromo, calculateDiscount } from "../utils/promo.js";
 
-// CHECKOUT - CUSTOMER
+// CHECKOUT - CUSTOMER (promo_code opsional)
 export const checkout = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    const { ticket_id, quantity } = req.body;
+    const { ticket_id, quantity, promo_code } = req.body;
     if (!ticket_id || !quantity || quantity < 1) {
       return res.status(400).json({ success: false, message: "Data checkout tidak valid" });
     }
@@ -39,15 +40,41 @@ export const checkout = async (req, res) => {
       return res.status(400).json({ success: false, message: "Kuota tiket tidak mencukupi" });
     }
 
-    const totalPrice = ticket.price * quantity;
+    const subtotal = Number(ticket.price) * Number(quantity);
+    let discount = 0;
+    let usedPromoCode = null;
+
+    if (promo_code) {
+      const result = await getValidPromo(connection, promo_code, ticket.event_id, true);
+      if (result.error) {
+        await connection.rollback();
+        return res.status(400).json({ success: false, message: result.error });
+      }
+      discount = calculateDiscount(result.promo, subtotal);
+      usedPromoCode = result.promo.code;
+
+      // kuota promo dikurangi secara atomik
+      const [upd] = await connection.query(
+        "UPDATE promos SET used = used + 1 WHERE id = ? AND used < quota",
+        [result.promo.id]
+      );
+      if (upd.affectedRows === 0) {
+        await connection.rollback();
+        return res.status(400).json({ success: false, message: "Kuota promo sudah habis" });
+      }
+    }
+
+    const totalPrice = subtotal - discount;
     const transactionId = uuidv4();
     const bookingCode = generateBookingCode();
     const expiredAt = new Date(Date.now() + 60 * 60 * 1000); // 1 jam
 
     await connection.query(
-      `INSERT INTO transactions (id, user_id, event_id, ticket_id, booking_code, quantity, total_price, status, expired_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      [transactionId, req.user.id, ticket.event_id, ticket_id, bookingCode, quantity, totalPrice, expiredAt]
+      `INSERT INTO transactions
+       (id, user_id, event_id, ticket_id, booking_code, quantity, total_price, status, expired_at, promo_code, discount_amount)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      [transactionId, req.user.id, ticket.event_id, ticket_id, bookingCode, quantity,
+       totalPrice, expiredAt, usedPromoCode, discount]
     );
 
     await connection.query("UPDATE tickets SET sold = sold + ? WHERE id = ?", [quantity, ticket_id]);
@@ -57,7 +84,15 @@ export const checkout = async (req, res) => {
     res.status(201).json({
       success: true,
       message: "Checkout berhasil, silakan lanjutkan pembayaran",
-      data: { transaction_id: transactionId, booking_code: bookingCode, total_price: totalPrice, expired_at: expiredAt },
+      data: {
+        transaction_id: transactionId,
+        booking_code: bookingCode,
+        subtotal,
+        discount_amount: discount,
+        promo_code: usedPromoCode,
+        total_price: totalPrice,
+        expired_at: expiredAt,
+      },
     });
   } catch (err) {
     await connection.rollback();
